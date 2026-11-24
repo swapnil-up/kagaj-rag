@@ -1,4 +1,4 @@
-import type { Env, ChatRequest, IngestionStats } from './types';
+import type { Env, ChatRequest, IngestionStats, Citation } from './types';
 import { runIngestion, getIngestionStats, getIngestionProgress, listDatasetFiles } from './ingest';
 import { ragChat, ragChatStream } from './rag';
 
@@ -12,14 +12,13 @@ function corsResponse(body: string | null = null, status = 200): Response {
 	return new Response(body, { status, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
 }
 
-function sseResponse(stream: AsyncGenerator<string>): Response {
+function sseResponse(stream: AsyncGenerator<{ type: 'delta' | 'citations' | 'related' | 'done'; content?: string; citations?: Citation[]; related?: string[] }>): Response {
 	const encoder = new TextEncoder();
 	const readable = new ReadableStream({
 		async start(controller) {
 			for await (const chunk of stream) {
-				controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta: chunk })}\n\n`));
+				controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 			}
-			controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
 			controller.close();
 		},
 	});
@@ -52,6 +51,37 @@ export default {
 			const files = await listDatasetFiles(env);
 			const datasets = [...new Set(files.map(f => f.path.split('/')[1]))];
 			return corsResponse(JSON.stringify({ datasets, file_count: files.length }));
+		}
+		if (url.pathname === '/api/debug/vectorize' && req.method === 'POST') {
+			const { question, topK = 5, dataset_filter } = await req.json().catch(() => ({})) as { question: string; topK?: number; dataset_filter?: string[] };
+			const { embedQuery, searchVectorize } = await import('./rag');
+			const queryVector = await embedQuery(env, question || 'test');
+			const results = await searchVectorize(env, queryVector, topK, dataset_filter);
+			return corsResponse(JSON.stringify({ matches: results }));
+		}
+		if (url.pathname === '/api/debug/chat' && req.method === 'POST') {
+			try {
+				const body = await req.json() as ChatRequest;
+				if (!body.question?.trim()) return corsResponse(JSON.stringify({ error: 'question required' }), 400);
+				
+				const { ragChat } = await import('./rag');
+				const result = await ragChat(env, body);
+				return corsResponse(JSON.stringify(result));
+			} catch (err) {
+				return corsResponse(JSON.stringify({ error: err instanceof Error ? err.message : 'Debug chat error' }), 400);
+			}
+		}
+		if (url.pathname === '/api/debug/rerank' && req.method === 'POST') {
+			try {
+				const { question, topK = 10, dataset_filter } = await req.json().catch(() => ({})) as { question: string; topK?: number; dataset_filter?: string[] };
+				const { embedQuery, searchVectorize, rerankResults } = await import('./rag');
+				const queryVector = await embedQuery(env, question || 'test');
+				const candidates = await searchVectorize(env, queryVector, 20, dataset_filter);
+				const citations = await rerankResults(env, question, candidates, 10);
+				return corsResponse(JSON.stringify({ candidates_count: candidates.length, citations }));
+			} catch (err) {
+				return corsResponse(JSON.stringify({ error: err instanceof Error ? err.message : 'Rerank error' }), 400);
+			}
 		}
 		
 		// Chat endpoints

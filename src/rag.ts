@@ -4,7 +4,7 @@ const EMBEDDING_MODEL = '@cf/baai/bge-m3';
 const RERANKER_MODEL = '@cf/baai/bge-reranker-base';
 const LLM_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const DEFAULT_TOP_K = 10;
-const RERANK_TOP_K = 5;
+const RERANK_TOP_K = 10;
 const MAX_CONTEXT_CHARS = 8000;
 
 const SYSTEM_PROMPT = `You are a research assistant for Kagaj — an open dataset of Nepali government documents.
@@ -45,15 +45,25 @@ export async function embedQuery(env: Env, query: string): Promise<number[]> {
 }
 
 export async function searchVectorize(env: Env, queryVector: number[], topK: number, datasetFilter?: string[]): Promise<VectorizeMetadata[]> {
-	const filter = datasetFilter?.length ? { dataset: { $in: datasetFilter } } : undefined;
-	const results = await env.VECTORIZE.query(queryVector, { topK, returnMetadata: true, filter });
+	// Fetch more results than needed, then filter in JavaScript
+	// This avoids issues with Vectorize filter syntax
+	// Vectorize max topK with returnMetadata=true is 50
+	const fetchK = datasetFilter?.length ? Math.min(topK * 5, 50) : topK;
+	const results = await env.VECTORIZE.query(queryVector, { topK: fetchK, returnMetadata: true });
 	const matches = results.matches as any[];
-	// Vectorize returns {id, score, metadata: {...}}, flatten metadata to top level
-	return matches.map((m: any) => ({
+	
+	// Filter in JavaScript
+	let filtered = matches.map((m: any) => ({
 		id: m.id,
 		score: m.score,
 		...m.metadata,
 	})) as VectorizeMetadata[];
+	
+	if (datasetFilter?.length) {
+		filtered = filtered.filter(m => datasetFilter.includes(m.dataset));
+	}
+	
+	return filtered.slice(0, topK);
 }
 
 export async function rerankResults(env: Env, query: string, candidates: VectorizeMetadata[], topK: number): Promise<Citation[]> {
@@ -119,7 +129,7 @@ export async function ragChat(env: Env, req: ChatRequest): Promise<ChatResponse>
 	return { answer, citations, related_questions };
 }
 
-export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator<string> {
+export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator<{ type: 'delta' | 'citations' | 'related' | 'done'; content?: string; citations?: Citation[]; related?: string[] }> {
 	const topK = req.top_k || DEFAULT_TOP_K;
 	const queryVector = await embedQuery(env, req.question);
 	const candidates = await searchVectorize(env, queryVector, topK * 2, req.dataset_filter);
@@ -135,16 +145,17 @@ export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator
 	});
 	
 	for await (const chunk of stream as AsyncIterable<any>) {
-		if (chunk.response) yield chunk.response;
+		if (chunk.response) yield { type: 'delta', content: chunk.response };
 	}
 	
-	// Yield citations as final event
-	yield `\n\n---\n**Sources:**\n${citations.map((c, i) => `[${i + 1}] ${c.dataset}/${c.type}: ${c.title || c.doc_id} (${c.date || 'n.d.'})${c.url ? ` — ${c.url}` : ''}`).join('\n')}`;
+	yield { type: 'citations', citations };
 	
 	if (citations.length > 0) {
 		const related = await generateRelatedQuestions(env, req.question, citations);
 		if (related.length > 0) {
-			yield `\n\n**Follow-up questions:**\n${related.map(q => `• ${q}`).join('\n')}`;
+			yield { type: 'related', related };
 		}
 	}
+	
+	yield { type: 'done' };
 }

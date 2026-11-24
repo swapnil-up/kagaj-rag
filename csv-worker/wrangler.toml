@@ -1,0 +1,19 @@
+name = "kagaj-csv-processor"
+main = "src/index.ts"
+compatibility_date = "2026-11-24"
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "kagaj-datasets"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "0c757870869b4d2db5ba5f4b917aac7f"
+
+[vars]
+KAGAJ_REPO_OWNER = "swapnil-up"
+KAGAJ_REPO_NAME = "kagaj"
+KAGAJ_DATASETS_PATH = "datasets"

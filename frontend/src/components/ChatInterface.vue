@@ -58,45 +58,19 @@ async function sendMessage() {
         question,
         history: messages.value.slice(0, -2).map(m => ({ role: m.role, content: m.content })),
         dataset_filter: datasetFilter.value.length ? datasetFilter.value : undefined,
-        stream: true,
+        stream: false,
       }),
     });
     
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     
-    const reader = resp.body?.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let done = false;
-    
-    while (reader && !done) {
-      const { value, done: readerDone } = await reader.read();
-      done = readerDone;
-      if (value) {
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
-        
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.delta) {
-                assistantMessage.content += data.delta;
-                scrollToBottom();
-              }
-              if (data.done) {
-                assistantMessage.isStreaming = false;
-                isLoading.value = false;
-                scrollToBottom();
-              }
-            } catch (e) {
-              // Ignore parse errors for incomplete chunks
-            }
-          }
-        }
-      }
-    }
+    const data = await resp.json();
+    assistantMessage.content = data.answer;
+    assistantMessage.citations = data.citations;
+    assistantMessage.relatedQuestions = data.related_questions;
+    assistantMessage.isStreaming = false;
+    isLoading.value = false;
+    scrollToBottom();
   } catch (err) {
     assistantMessage.content = `Error: ${err instanceof Error ? err.message : 'Failed to get response'}`;
     assistantMessage.isStreaming = false;
@@ -196,10 +170,10 @@ function useSuggestion(q: string) {
               <div class="space-y-1">
                 <div v-for="(cit, ci) in msg.citations" :key="ci" class="text-xs text-gray-600 dark:text-gray-400">
                   <span class="font-mono text-indigo-600 dark:text-indigo-400">[{{ ci + 1 }}]</span>
-                  <span class="font-medium">{{ cit.dataset }}/{{ cit.type }}</span>
-                  <span v-if="cit.title"> — {{ cit.title }}</span>
-                  <span v-if="cit.date"> ({{ cit.date }})</span>
-                  <a v-if="cit.url" :href="cit.url" target="_blank" rel="noopener" class="ml-1 underline hover:text-indigo-600">source</a>
+                  <span class="font-medium text-gray-900 dark:text-white">{{ cit.doc_id || cit.title || 'Unknown' }}</span>
+                  <span class="text-gray-500 dark:text-gray-400 ml-1">({{ cit.dataset }}/{{ cit.type }})</span>
+                  <span v-if="cit.date"> · {{ cit.date }}</span>
+                  <a v-if="cit.url" :href="cit.url" target="_blank" rel="noopener" class="ml-1 underline hover:text-indigo-600 text-indigo-600">source</a>
                 </div>
               </div>
             </div>
