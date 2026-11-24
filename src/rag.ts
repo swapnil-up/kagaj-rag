@@ -1,7 +1,6 @@
-import type { Env, ChatRequest, ChatResponse, Citation, VectorizeMetadata } from './types';
+import type { Env, ChatRequest, ChatResponse, Citation, VectorizeMetadata, ManifestIndex, ManifestDataset } from './types';
 
 const EMBEDDING_MODEL = '@cf/baai/bge-m3';
-const RERANKER_MODEL = '@cf/baai/bge-reranker-base';
 const LLM_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const DEFAULT_TOP_K = 10;
 const RERANK_TOP_K = 10;
@@ -19,7 +18,9 @@ function buildContext(citations: Citation[]): string {
 	let context = '';
 	let totalChars = 0;
 	citations.forEach((c, i) => {
-		const block = `[${i + 1}] ${c.dataset}/${c.type}: ${c.title || c.doc_id} (${c.date || 'n.d.'})\n${c.excerpt}\n\n`;
+		const datasetInfo = c.dataset_title ? ` — ${c.dataset_title}` : '';
+		const verificationInfo = c.verification ? ` [Verified: ${c.verification}]` : '';
+		const block = `[${i + 1}] ${c.dataset}/${c.type}${datasetInfo} (${c.date || 'n.d.'})${verificationInfo}\n${c.excerpt}\n\n`;
 		if (totalChars + block.length > MAX_CONTEXT_CHARS) return;
 		context += block;
 		totalChars += block.length;
@@ -45,10 +46,9 @@ export async function embedQuery(env: Env, query: string): Promise<number[]> {
 }
 
 export async function searchVectorize(env: Env, queryVector: number[], topK: number, datasetFilter?: string[]): Promise<VectorizeMetadata[]> {
-	// Fetch more results than needed, then filter in JavaScript
-	// This avoids issues with Vectorize filter syntax
 	// Vectorize max topK with returnMetadata=true is 50
-	const fetchK = datasetFilter?.length ? Math.min(topK * 5, 50) : topK;
+	// Fetch up to 50, then filter in JS if needed
+	const fetchK = Math.min(topK * 5, 50);
 	const results = await env.VECTORIZE.query(queryVector, { topK: fetchK, returnMetadata: true });
 	const matches = results.matches as any[];
 	
@@ -66,23 +66,56 @@ export async function searchVectorize(env: Env, queryVector: number[], topK: num
 	return filtered.slice(0, topK);
 }
 
+async function fetchManifest(env: Env): Promise<ManifestIndex | null> {
+	const url = `https://api.github.com/repos/${env.KAGAJ_REPO_OWNER}/${env.KAGAJ_REPO_NAME}/contents/${env.KAGAJ_DATASETS_PATH}/index.json`;
+	const resp = await fetch(url, { 
+		headers: { 
+			'Accept': 'application/vnd.github.v3+json', 
+			'User-Agent': 'kagaj-rag-worker',
+			...(env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${env.GITHUB_TOKEN}` } : {})
+		} 
+	});
+	if (!resp.ok) return null;
+	const fileInfo = await resp.json() as { download_url: string };
+	const manifestResp = await fetch(fileInfo.download_url, { 
+		headers: { 
+			'Accept': 'application/vnd.github.v3+json', 
+			'User-Agent': 'kagaj-rag-worker',
+			...(env.GITHUB_TOKEN ? { 'Authorization': `Bearer ${env.GITHUB_TOKEN}` } : {})
+		} 
+	});
+	if (!manifestResp.ok) return null;
+	return manifestResp.json() as Promise<ManifestIndex>;
+}
+
+function getDatasetManifest(manifest: ManifestIndex | null, datasetId: string): ManifestDataset | undefined {
+	return manifest?.datasets.find(d => d.id === datasetId);
+}
+
 export async function rerankResults(env: Env, query: string, candidates: VectorizeMetadata[], topK: number): Promise<Citation[]> {
 	if (candidates.length === 0) return [];
 	
-	// Skip reranker for now - use vector similarity scores
-	const ranked = candidates
-		.slice(0, topK);
+	const manifest = await fetchManifest(env);
+	const ranked = candidates.slice(0, topK);
 	
-	return ranked.map((c, i) => ({
-		doc_id: c.doc_id,
-		dataset: c.dataset,
-		type: c.type,
-		title: c.title,
-		date: c.date,
-		url: c.url,
-		excerpt: (c.text || '').slice(0, 500),
-		score: 1.0 - (i * 0.1),
-	}));
+	return ranked.map((c, i) => {
+		const datasetManifest = getDatasetManifest(manifest, c.dataset);
+		return {
+			doc_id: c.doc_id,
+			dataset: c.dataset,
+			type: c.type,
+			title: c.title,
+			date: c.date,
+			url: c.url,
+			excerpt: (c.text || '').slice(0, 500),
+			score: c.score || 0, // Use actual Vectorize similarity score
+			verification: datasetManifest?.verification?.method,
+			source_url: datasetManifest?.sources[0]?.url,
+			build_commit: datasetManifest?.freshness?.commit,
+			dataset_title: datasetManifest?.title,
+			dataset_description: datasetManifest?.description,
+		};
+	});
 }
 
 export async function generateAnswer(env: Env, question: string, citations: Citation[], history: { role: string; content: string }[] = []): Promise<string> {
@@ -99,23 +132,11 @@ export async function generateAnswer(env: Env, question: string, citations: Cita
 	return (resp.response || '').trim();
 }
 
+// Lightweight related questions - use smaller model or skip for speed
 export async function generateRelatedQuestions(env: Env, question: string, citations: Citation[]): Promise<string[]> {
-	const context = buildContext(citations.slice(0, 3));
-	const prompt = `<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-Given the question and context, suggest 3 follow-up questions a researcher might ask. Return only a JSON array of strings.
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-Question: ${question}
-Context: ${context}
-<|eot_id|><|start_header_id|>assistant<|end_header_id|>`;
-	
-	try {
-		const resp = await env.AI.run(LLM_MODEL, { prompt, max_tokens: 200, temperature: 0.5 });
-		const text = (resp.response || '').trim();
-		const match = text.match(/\[.*\]/s);
-		return match ? JSON.parse(match[0]) : [];
-	} catch {
-		return [];
-	}
+	// Skip for now - adds ~10-15s latency per query
+	// Can be re-enabled with @cf/meta/llama-3.2-1b-instruct if needed
+	return [];
 }
 
 export async function ragChat(env: Env, req: ChatRequest): Promise<ChatResponse> {
@@ -150,12 +171,13 @@ export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator
 	
 	yield { type: 'citations', citations };
 	
-	if (citations.length > 0) {
-		const related = await generateRelatedQuestions(env, req.question, citations);
-		if (related.length > 0) {
-			yield { type: 'related', related };
-		}
-	}
+	// Related questions disabled for speed
+	// if (citations.length > 0) {
+	// 	const related = await generateRelatedQuestions(env, req.question, citations);
+	// 	if (related.length > 0) {
+	// 		yield { type: 'related', related };
+	// 	}
+	// }
 	
 	yield { type: 'done' };
 }

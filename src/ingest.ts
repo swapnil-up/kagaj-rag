@@ -1,4 +1,4 @@
-import type { Env, DatasetFile, ChunkMetadata, IngestionStats } from './types';
+import type { Env, DatasetFile, ChunkMetadata, IngestionStats, ManifestDataset, ManifestIndex } from './types';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const CHUNK_SIZE = 1000;
@@ -17,15 +17,6 @@ function ghHeaders(env: Env): Record<string, string> {
 	if (env.GITHUB_TOKEN) h['Authorization'] = `Bearer ${env.GITHUB_TOKEN}`;
 	return h;
 }
-
-const DATASET_CONFIG: Record<string, { type: string; titleField?: string; dateField?: string }> = {
-	'translations': { type: 'parliament', titleField: 'title', dateField: 'date' },
-	'labour-migration': { type: 'labour_migration', titleField: 'district', dateField: 'period' },
-	'water': { type: 'water_schedule', titleField: 'branch', dateField: 'month' },
-	'crime': { type: 'crime_bulletin', titleField: 'category', dateField: 'month' },
-	'oag-audit': { type: 'oag_audit', titleField: 'local_level', dateField: 'fiscal_year' },
-	'govweb': { type: 'govweb_infra', titleField: 'hostname', dateField: 'observed_at' },
-};
 
 const CSV_GZ_FILES = [
 	'reachability.csv.gz',
@@ -105,18 +96,21 @@ async function parseCSVGZ(url: string, env: Env): Promise<string[][]> {
 	});
 }
 
-function extractTextFromJSON(obj: any, dataset: string): string[] {
-	const config = DATASET_CONFIG[dataset] || { type: dataset };
+function extractTextFromJSON(obj: any, dataset: string, manifest: ManifestDataset | undefined): string[] {
+	const type = manifest?.artifacts.find(a => a.role === 'primary')?.format || 'json';
 	const texts: string[] = [];
 
 	if (Array.isArray(obj)) {
 		obj.forEach((item, idx) => {
 			if (typeof item === 'object' && item !== null) {
 				const parts: string[] = [];
-				if (config.titleField && item[config.titleField]) parts.push(`${config.titleField}: ${item[config.titleField]}`);
-				if (config.dateField && item[config.dateField]) parts.push(`${config.dateField}: ${item[config.dateField]}`);
+				// Use manifest info if available
+				if (manifest) {
+					if (manifest.grain) parts.push(`grain: ${manifest.grain}`);
+					if (manifest.coverage) parts.push(`coverage: ${manifest.coverage.start}–${manifest.coverage.end}`);
+				}
 				Object.entries(item).forEach(([k, v]) => {
-					if (k !== config.titleField && k !== config.dateField && v != null) {
+					if (v != null) {
 						parts.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
 					}
 				});
@@ -131,25 +125,21 @@ function extractTextFromJSON(obj: any, dataset: string): string[] {
 			keys.forEach(k => {
 				const v = obj[k];
 				if (v != null) {
-					const prefix = config.titleField && obj[config.titleField] ? `${config.titleField}: ${obj[config.titleField]} | ` : '';
-					const datePrefix = config.dateField && obj[config.dateField] ? `${config.dateField}: ${obj[config.dateField]} | ` : '';
 					const valStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
 					if (valStr.length > 50000) {
 						const chunks = chunkLargeText(valStr, MAX_TOKENS_PER_CHUNK);
 						chunks.forEach((chunk, idx) => {
-							texts.push(`${prefix}${datePrefix}${k}[${idx}]: ${chunk}`);
+							texts.push(`${k}[${idx}]: ${chunk}`);
 						});
 					} else {
-						texts.push(`${prefix}${datePrefix}${k}: ${valStr}`);
+						texts.push(`${k}: ${valStr}`);
 					}
 				}
 			});
 		} else {
 			const parts: string[] = [];
-			if (config.titleField && obj[config.titleField]) parts.push(`${config.titleField}: ${obj[config.titleField]}`);
-			if (config.dateField && obj[config.dateField]) parts.push(`${config.dateField}: ${obj[config.dateField]}`);
 			Object.entries(obj).forEach(([k, v]) => {
-				if (k !== config.titleField && k !== config.dateField && v != null) {
+				if (v != null) {
 					const valStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
 					if (valStr.length > 50000) {
 						const chunks = chunkLargeText(valStr, MAX_TOKENS_PER_CHUNK);
@@ -168,7 +158,7 @@ function extractTextFromJSON(obj: any, dataset: string): string[] {
 	return texts;
 }
 
-function extractTextFromCSV(rows: string[][], dataset: string): string[] {
+function extractTextFromCSV(rows: string[][], dataset: string, manifest: ManifestDataset | undefined): string[] {
 	if (rows.length < 2) return [];
 	const headers = rows[0];
 	const texts: string[] = [];
@@ -187,6 +177,20 @@ function extractTextFromCSV(rows: string[][], dataset: string): string[] {
 		}
 	}
 	return texts;
+}
+
+async function fetchManifest(env: Env): Promise<ManifestIndex | null> {
+	const url = `${GITHUB_API_BASE}/repos/${env.KAGAJ_REPO_OWNER}/${env.KAGAJ_REPO_NAME}/contents/${env.KAGAJ_DATASETS_PATH}/index.json`;
+	const resp = await fetch(url, { headers: ghHeaders(env) });
+	if (!resp.ok) return null;
+	const fileInfo = await resp.json() as { download_url: string };
+	const manifestResp = await fetch(fileInfo.download_url, { headers: ghHeaders(env) });
+	if (!manifestResp.ok) return null;
+	return manifestResp.json() as Promise<ManifestIndex>;
+}
+
+function getDatasetManifest(manifest: ManifestIndex | null, dataset: string): ManifestDataset | undefined {
+	return manifest?.datasets.find(d => d.id === dataset);
 }
 
 export async function listDatasetFiles(env: Env): Promise<DatasetFile[]> {
@@ -262,6 +266,7 @@ export async function runIngestion(env: Env, options: { limit?: number; offset?:
 	};
 
 	try {
+		const manifest = await fetchManifest(env);
 		const files = await listDatasetFiles(env);
 		stats.total_files = files.length;
 
@@ -270,6 +275,7 @@ export async function runIngestion(env: Env, options: { limit?: number; offset?:
 		for (const file of batch) {
 			try {
 				const dataset = file.path.split('/')[1];
+				const datasetManifest = getDatasetManifest(manifest, dataset);
 				const currentSha = await getFileSha(env, file.path);
 				if (!force && currentSha && currentSha === file.sha) {
 					stats.skipped++;
@@ -281,22 +287,22 @@ export async function runIngestion(env: Env, options: { limit?: number; offset?:
 				let texts: string[] = [];
 				
 				if (file.name.endsWith('.csv.gz')) {
-					texts = extractTextFromCSV(content as string[][], dataset);
+					texts = extractTextFromCSV(content as string[][], dataset, datasetManifest);
 				} else {
-					texts = extractTextFromJSON(content, dataset);
+					texts = extractTextFromJSON(content, dataset, datasetManifest);
 				}
 
-				const maxTexts = file.name.endsWith('.csv.gz') ? 25 : 100;
-				if (texts.length > 25) {
-					texts = texts.slice(0, 25);
-					stats.errors.push(`${file.path}: Truncated to 25 texts (was ${texts.length + 25})`);
+				const maxTexts = file.name.endsWith('.csv.gz') ? MAX_TEXTS_PER_CSV_FILE : MAX_TEXTS_PER_FILE;
+				if (texts.length > maxTexts) {
+					texts = texts.slice(0, maxTexts);
+					stats.errors.push(`${file.path}: Truncated to ${maxTexts} texts`);
 				}
 
 				for (let i = 0; i < texts.length; i++) {
-					const largeChunks = chunkLargeText(texts[i], 40000);
+					const largeChunks = chunkLargeText(texts[i], MAX_TOKENS_PER_CHUNK);
 					
 					for (const largeChunk of largeChunks) {
-						const chunks = chunkText(largeChunk, 1000, 150);
+						const chunks = chunkText(largeChunk, CHUNK_SIZE, CHUNK_OVERLAP);
 						stats.total_chunks += chunks.length;
 
 						const embeddings = await embedTexts(env, chunks);
@@ -306,7 +312,7 @@ export async function runIngestion(env: Env, options: { limit?: number; offset?:
 							metadata: {
 								doc_id: file.name.replace(/\.(json|csv\.gz)$/, ''),
 								dataset,
-								type: 'govweb_infra',
+								type: datasetManifest?.id || 'unknown',
 								segment_idx: idx,
 								total_segments: chunks.length,
 								sha: file.sha,
@@ -347,4 +353,8 @@ export async function getIngestionProgress(env: Env): Promise<{ processed: numbe
 export async function getIngestionStats(env: Env): Promise<IngestionStats | null> {
 	const cached = await env.CACHE.get('ingestion:stats');
 	return cached ? JSON.parse(cached) : null;
+}
+
+export async function getManifest(env: Env): Promise<ManifestIndex | null> {
+	return fetchManifest(env);
 }

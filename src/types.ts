@@ -55,6 +55,35 @@ export interface Citation {
 	url?: string;
 	excerpt: string;
 	score: number;
+	verification?: string;
+	source_url?: string;
+	build_commit?: string;
+	dataset_title?: string;
+	dataset_description?: string;
+}
+
+export interface ManifestDataset {
+	id: string;
+	title: string;
+	description: string;
+	status: string;
+	grain: string;
+	coverage: { start: string; end: string; note?: string };
+	sources: Array<{ name: string; url: string }>;
+	verification: { status: string; method: string; report?: string };
+	pipeline: { package: string; cli: string; plan?: string };
+	license: { code: string; data: string };
+	tags: string[];
+	notes: string[];
+	docs: string[];
+	inventories: string[];
+	freshness: { fingerprints: string[]; commit: string };
+	artifacts: Array<{ path: string; role: string; format: string; bytes: number; columns?: string[]; sha256: string; description?: string }>;
+}
+
+export interface ManifestIndex {
+	schema_version: string;
+	datasets: ManifestDataset[];
 }
 
 export interface ChatResponse {
