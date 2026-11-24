@@ -1,4 +1,4 @@
-import type { Env, ChatRequest, IngestionStats, Citation } from './types';
+import type { Env, ChatRequest, IngestionStats, Citation, ChatResponse } from './types';
 import { runIngestion, getIngestionStats, getIngestionProgress, listDatasetFiles, getManifest } from './ingest';
 import { ragChat, ragChatStream } from './rag';
 
@@ -7,6 +7,8 @@ const CORS_HEADERS = {
 	'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 	'Access-Control-Allow-Headers': 'Content-Type',
 };
+
+const DAILY_NEURON_CAP = 9000;
 
 function corsResponse(body: string | null = null, status = 200): Response {
 	return new Response(body, { status, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
@@ -104,6 +106,19 @@ export default {
 					freshness: d.freshness,
 					artifact_count: d.artifacts.length,
 				}))
+			}));
+		}
+		
+		// Neuron usage stats (public)
+		if (url.pathname === '/api/neurons') {
+			const day = new Date().toISOString().split('T')[0];
+			const key = `neurons:${day}`;
+			const used = await env.CACHE.get(key);
+			return corsResponse(JSON.stringify({ 
+				date: day,
+				used: used ? parseInt(used) : 0,
+				cap: DAILY_NEURON_CAP,
+				remaining: Math.max(0, DAILY_NEURON_CAP - (used ? parseInt(used) : 0))
 			}));
 		}
 		

@@ -2,9 +2,12 @@ import type { Env, ChatRequest, ChatResponse, Citation, VectorizeMetadata, Manif
 
 const EMBEDDING_MODEL = '@cf/baai/bge-m3';
 const LLM_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const STREAM_MODEL = '@cf/meta/llama-3.2-3b-instruct'; // Smaller model that actually streams
 const DEFAULT_TOP_K = 10;
 const RERANK_TOP_K = 10;
 const MAX_CONTEXT_CHARS = 8000;
+const CACHE_TTL = 86400; // 24 hours
+const DAILY_NEURON_CAP = 9000; // Leave 1000 buffer under 10k free tier
 
 const SYSTEM_PROMPT = `You are a research assistant for Kagaj — an open dataset of Nepali government documents.
 You have access to parliament notices, verbatims, water schedules, crime bulletins, OAG audit reports, labour migration data, and .gov.np infrastructure data.
@@ -12,7 +15,7 @@ You have access to parliament notices, verbatims, water schedules, crime bulleti
 Answer questions accurately using ONLY the provided context. Cite sources inline like [1], [2].
 If the context doesn't contain the answer, say so — don't hallucinate.
 Connect insights across datasets when relevant (e.g., parliament discussion + OAG audit on same topic).
-Be concise but thorough. Suggest follow-up questions at the end.`;
+Be concise but thorough.`;
 
 function buildContext(citations: Citation[]): string {
 	let context = '';
@@ -40,19 +43,59 @@ function buildPrompt(question: string, context: string, history: { role: string;
 	return prompt;
 }
 
+// Simple hash for cache keys
+function hashKey(input: string): string {
+	let hash = 0;
+	for (let i = 0; i < input.length; i++) {
+		hash = ((hash << 5) - hash) + input.charCodeAt(i);
+		hash |= 0;
+	}
+	return Math.abs(hash).toString(36);
+}
+
+function getCacheKey(question: string, datasetFilter?: string[], indexVersion?: string): string {
+	const filterStr = datasetFilter?.sort().join(',') || 'all';
+	const version = indexVersion || 'v1';
+	return `chat:${hashKey(question)}:${hashKey(filterStr)}:${version}`;
+}
+
+function getNeuronKey(): string {
+	const day = new Date().toISOString().split('T')[0];
+	return `neurons:${day}`;
+}
+
+async function checkNeuronBudget(env: Env, estimated: number): Promise<boolean> {
+	const key = getNeuronKey();
+	const current = await env.CACHE.get(key);
+	const used = current ? parseInt(current) : 0;
+	return (used + estimated) < DAILY_NEURON_CAP;
+}
+
+async function incrementNeurons(env: Env, count: number): Promise<void> {
+	const key = getNeuronKey();
+	const current = await env.CACHE.get(key);
+	const used = current ? parseInt(current) : 0;
+	await env.CACHE.put(key, String(used + count), { expirationTtl: 86400 });
+}
+
+// Estimate neurons: embedding ~50, LLM ~1000-3000 depending on context
+function estimateNeurons(citationCount: number, stream: boolean): number {
+	const embedding = 50;
+	const llmBase = stream ? 1500 : 2000; // Streaming uses more tokens
+	const contextFactor = citationCount * 100;
+	return embedding + llmBase + contextFactor;
+}
+
 export async function embedQuery(env: Env, query: string): Promise<number[]> {
 	const resp = await env.AI.run(EMBEDDING_MODEL, { text: [query] });
 	return (resp.data as number[][])[0];
 }
 
 export async function searchVectorize(env: Env, queryVector: number[], topK: number, datasetFilter?: string[]): Promise<VectorizeMetadata[]> {
-	// Vectorize max topK with returnMetadata=true is 50
-	// Fetch up to 50, then filter in JS if needed
 	const fetchK = Math.min(topK * 5, 50);
 	const results = await env.VECTORIZE.query(queryVector, { topK: fetchK, returnMetadata: true });
 	const matches = results.matches as any[];
 	
-	// Filter in JavaScript
 	let filtered = matches.map((m: any) => ({
 		id: m.id,
 		score: m.score,
@@ -108,7 +151,7 @@ export async function rerankResults(env: Env, query: string, candidates: Vectori
 			date: c.date,
 			url: c.url,
 			excerpt: (c.text || '').slice(0, 500),
-			score: c.score || 0, // Use actual Vectorize similarity score
+			score: c.score || 0,
 			verification: datasetManifest?.verification?.method,
 			source_url: datasetManifest?.sources[0]?.url,
 			build_commit: datasetManifest?.freshness?.commit,
@@ -116,6 +159,64 @@ export async function rerankResults(env: Env, query: string, candidates: Vectori
 			dataset_description: datasetManifest?.description,
 		};
 	});
+}
+
+// In-flight request deduplication
+const inflightRequests = new Map<string, Promise<ChatResponse>>();
+
+export async function ragChat(env: Env, req: ChatRequest): Promise<ChatResponse> {
+	const topK = req.top_k || DEFAULT_TOP_K;
+	const indexVersion = req.dataset_filter?.sort().join(',') || 'all';
+	const cacheKey = getCacheKey(req.question, req.dataset_filter, indexVersion);
+	
+	// Check cache first
+	const cached = await env.CACHE.get(cacheKey);
+	if (cached) {
+		const hit = JSON.parse(cached);
+		return { ...hit, cached: true };
+	}
+	
+	// Check in-flight deduplication
+	const inflightKey = `${cacheKey}:${req.stream || false}`;
+	if (inflightRequests.has(inflightKey)) {
+		return inflightRequests.get(inflightKey)!;
+	}
+	
+	// Estimate and check neuron budget
+	const queryVector = await embedQuery(env, req.question);
+	const candidates = await searchVectorize(env, queryVector, topK * 2, req.dataset_filter);
+	const estimatedNeurons = estimateNeurons(Math.min(candidates.length, RERANK_TOP_K), req.stream || false);
+	
+	const budgetOk = await checkNeuronBudget(env, estimatedNeurons);
+	if (!budgetOk) {
+		return {
+			answer: 'Daily query limit reached. Please try again tomorrow.',
+			citations: [],
+			related_questions: [],
+			rate_limited: true
+		};
+	}
+	
+	const promise = (async () => {
+		try {
+			const citations = await rerankResults(env, req.question, candidates, RERANK_TOP_K);
+			const answer = await generateAnswer(env, req.question, citations, req.history || []);
+			
+			await incrementNeurons(env, estimatedNeurons);
+			
+			const result = { answer, citations, related_questions: [] };
+			
+			// Cache the result
+			await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: CACHE_TTL });
+			
+			return result;
+		} finally {
+			inflightRequests.delete(inflightKey);
+		}
+	})();
+	
+	inflightRequests.set(inflightKey, promise);
+	return promise;
 }
 
 export async function generateAnswer(env: Env, question: string, citations: Citation[], history: { role: string; content: string }[] = []): Promise<string> {
@@ -132,24 +233,6 @@ export async function generateAnswer(env: Env, question: string, citations: Cita
 	return (resp.response || '').trim();
 }
 
-// Lightweight related questions - use smaller model or skip for speed
-export async function generateRelatedQuestions(env: Env, question: string, citations: Citation[]): Promise<string[]> {
-	// Skip for now - adds ~10-15s latency per query
-	// Can be re-enabled with @cf/meta/llama-3.2-1b-instruct if needed
-	return [];
-}
-
-export async function ragChat(env: Env, req: ChatRequest): Promise<ChatResponse> {
-	const topK = req.top_k || DEFAULT_TOP_K;
-	const queryVector = await embedQuery(env, req.question);
-	const candidates = await searchVectorize(env, queryVector, topK * 2, req.dataset_filter);
-	const citations = await rerankResults(env, req.question, candidates, RERANK_TOP_K);
-	const answer = await generateAnswer(env, req.question, citations, req.history || []);
-	const related_questions = await generateRelatedQuestions(env, req.question, citations);
-	
-	return { answer, citations, related_questions };
-}
-
 export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator<{ type: 'delta' | 'citations' | 'related' | 'done'; content?: string; citations?: Citation[]; related?: string[] }> {
 	const topK = req.top_k || DEFAULT_TOP_K;
 	const queryVector = await embedQuery(env, req.question);
@@ -158,7 +241,8 @@ export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator
 	const context = buildContext(citations);
 	const prompt = buildPrompt(req.question, context, req.history || []);
 	
-	const stream = await env.AI.run(LLM_MODEL, {
+	// Use smaller model for streaming that actually yields deltas
+	const stream = await env.AI.run(STREAM_MODEL, {
 		prompt,
 		max_tokens: 1024,
 		temperature: 0.3,
@@ -170,14 +254,5 @@ export async function* ragChatStream(env: Env, req: ChatRequest): AsyncGenerator
 	}
 	
 	yield { type: 'citations', citations };
-	
-	// Related questions disabled for speed
-	// if (citations.length > 0) {
-	// 	const related = await generateRelatedQuestions(env, req.question, citations);
-	// 	if (related.length > 0) {
-	// 		yield { type: 'related', related };
-	// 	}
-	// }
-	
 	yield { type: 'done' };
 }
