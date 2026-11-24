@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "description": "Golden question set for Kagaj RAG evaluation. Each question has expected citations (doc_id patterns) and key facts that must appear in the answer.",
+  "questions": [
+    {
+      "id": "gq-001",
+      "question": "Which .gov.np domains have reachability_state refused?",
+      "dataset_filter": ["govweb"],
+      "expected_citations": ["entity_hosting-*"],
+      "must_contain": ["refused", "reachability_state", "apex_hostname"],
+      "must_not_contain": ["hallucinated domain names"],
+      "notes": "Should cite entity_hosting rows with reachability_state: refused"
+    },
+    {
+      "id": "gq-002",
+      "question": "What is the water supply schedule for Baneshwor branch in 2083 Ashoj?",
+      "dataset_filter": ["water"],
+      "expected_citations": ["Baneshwor__2083_Ashoj"],
+      "must_contain": ["Baneshwor", "2083", "Ashoj", "reservoir", "zone", "time"],
+      "notes": "Should cite specific branch schedule"
+    },
+    {
+      "id": "gq-003",
+      "question": "What health-related bills did parliament discuss in 2083?",
+      "dataset_filter": ["translations"],
+      "expected_citations": ["*Health*", "*2083*"],
+      "must_contain": ["Health", "2083", "bill"],
+      "notes": "Should find Health Science Academy Bill, Safe Motherhood, etc."
+    },
+    {
+      "id": "gq-004",
+      "question": "How many migrants went from Achham district in FY 2083/84?",
+      "dataset_filter": ["labour-migration"],
+      "expected_citations": ["migration_Achham*2083/84*"],
+      "must_contain": ["Achham", "2083/84", "total", "migrants"],
+      "notes": "Should aggregate across all destinations/channels"
+    },
+    {
+      "id": "gq-005",
+      "question": "What is the total budget for Kamalbazar Municipality in FY 2083 (2081/82)?",
+      "dataset_filter": ["oag-audit"],
+      "expected_citations": ["oag_local_level_Kamalbazar*"],
+      "must_contain": ["Kamalbazar", "total_budget", "2083"],
+      "notes": "Should cite OAG budget_summary or sector_budget"
+    },
+    {
+      "id": "gq-006",
+      "question": "Which provinces had the most rape cases in 2075/76?",
+      "dataset_filter": ["crime"],
+      "expected_citations": ["violent_monthly*2075-11*"],
+      "must_contain": ["rape", "2075/76", "province", "cases"],
+      "notes": "Should cite violent_monthly with offense=rape"
+    },
+    {
+      "id": "gq-007",
+      "question": "What percentage of .gov.np hostnames are reachable?",
+      "dataset_filter": ["govweb"],
+      "expected_citations": ["reachability-*"],
+      "must_contain": ["reachable", "percentage", "reachability_state"],
+      "notes": "Should compute from reachability.csv.gz data"
+    },
+    {
+      "id": "gq-008",
+      "question": "Which local levels in Bagmati Province have OAG audit findings?",
+      "dataset_filter": ["oag-audit"],
+      "expected_citations": ["oag_local_level_*Bagmati*"],
+      "must_contain": ["Bagmati", "beruju", "local_level"],
+      "notes": "Should cite beruju_classification or beruju_summary"
+    },
+    {
+      "id": "gq-009",
+      "question": "What are the top 5 destination countries for labour migration from Kathmandu district?",
+      "dataset_filter": ["labour-migration"],
+      "expected_citations": ["migration_Kathmandu*"],
+      "must_contain": ["Kathmandu", "destination", "total"],
+      "notes": "Should aggregate across channels and FYs"
+    },
+    {
+      "id": "gq-010",
+      "question": "Which .gov.np domains use TLS 1.3?",
+      "dataset_filter": ["govweb"],
+      "expected_citations": ["tls-*"],
+      "must_contain": ["TLS", "1.3", "protocol"],
+      "notes": "Should cite tls.csv.gz records"
+    }
+  ]
+}
